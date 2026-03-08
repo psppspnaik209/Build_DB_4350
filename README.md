@@ -30,6 +30,6 @@ if (Test-Path "data.db") { Remove-Item "data.db" }
 ```
 
 
-## Tested with gradebot v1.1.0
+## Tested with gradebot v1.1.1
 
 ![final grade output from gradebot](result.png)

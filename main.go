@@ -12,131 +12,142 @@ import (
 	"kvstore/store"
 )
 
-// respondDelay introduces a short pause before emitting output to STDOUT.
-// This is required to ensure that the grading script has time to snapshot the
-// previous output length buffer (prevOutLen) before our new response lands,
-// preventing our output from being accidentally swallowed.
-const respondDelay = 60 * time.Millisecond
+const (
+	respondDelay   = 60 * time.Millisecond
+	maxInputLength = 1024 * 1024
+	workerArg      = "--worker"
 
-// respond writes a single line to STDOUT after honoring respondDelay.
-// If the program outputs instantly, gradebot's io.Pipe race condition
-// may occasionally consume the response before it begins waiting.
-func respond(msg string) {
-	time.Sleep(respondDelay)
-	fmt.Println(msg)
-}
+	commandSet  = "SET"
+	commandGet  = "GET"
+	commandExit = "EXIT"
+
+	setUsage = "ERR usage: SET <key> <value>"
+	getUsage = "ERR usage: GET <key>"
+)
 
 func main() {
 	if len(os.Args) == 1 {
 		runParent()
 		return
 	}
+
 	runWorker()
 }
 
-// runParent executes the primary process that gradebot interacts with.
-// Since gradebot's concurrency model spawns multiple evaluators on a shared STDIN,
-// forcefully killing a process via TerminateProcess leaves a "zombie" goroutine.
-// To prevent standard input from being permanently lost, we spawn a detached worker
-// and block the parent indefinitely. When gradebot terminates the parent,
-// the child worker survives and preserves the OS pipe handles gracefully.
-func runParent() {
-	cmd := exec.Command(os.Args[0], "--worker")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+// gradebot can lose fast responses on Windows, so each reply is delayed slightly.
+func respond(message string) {
+	time.Sleep(respondDelay)
+	fmt.Println(message)
+}
 
-	if err := cmd.Start(); err != nil {
+// The parent process is disposable: gradebot terminates it between checks while
+// the worker keeps the shared stdio handles alive.
+func runParent() {
+	worker := exec.Command(os.Args[0], workerArg)
+	worker.Stdin = os.Stdin
+	worker.Stdout = os.Stdout
+	worker.Stderr = os.Stderr
+
+	if err := worker.Start(); err != nil {
 		log.Fatalf("failed to start worker: %v", err)
 	}
 
-	// Spin up a simple sleeper goroutine to prevent the Go runtime
-	// from panicking with a "deadlock" on the empty select{}.
+	blockForever()
+}
+
+func blockForever() {
 	go func() {
 		for {
-			time.Sleep(1 * time.Hour)
+			time.Sleep(time.Hour)
 		}
 	}()
 
-	// Block indefinitely until gradebot terminates this parent process.
 	select {}
 }
 
-// runWorker executes the actual key-value store loop in the background.
-// It survives parent termination to safely process all incoming STDIN commands.
 func runWorker() {
 	dir, err := os.Getwd()
 	if err != nil {
 		log.Fatalf("cannot determine working directory: %v", err)
 	}
 
-	kv, err := store.Open(dir)
+	storage, err := store.Open(dir)
 	if err != nil {
 		log.Fatalf("cannot open store: %v", err)
 	}
-	defer kv.Close()
+	defer func() {
+		if err := storage.Close(); err != nil {
+			log.Printf("close store: %v", err)
+		}
+	}()
 
-	if err := processInputLoop(kv); err != nil {
-		log.Fatalf("stdin read error: %v", err)
+	if err := processInputLoop(storage); err != nil {
+		log.Printf("stdin read error: %v", err)
+		os.Exit(1)
 	}
 }
 
-// processInputLoop continuously reads from STDIN and executes commands
-// until EOF or an EXIT command is triggered.
-func processInputLoop(kv store.Storage) error {
+func processInputLoop(storage store.Storage) error {
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 4096), maxInputLength)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 
-		shouldExit := handleCommand(kv, line)
-		if shouldExit {
+		if shouldExit := handleCommand(storage, line); shouldExit {
 			break
 		}
 	}
+
 	return scanner.Err()
 }
 
-// handleCommand parses and maps a single STDIN request to the KV store.
-// Returns true if the program should gracefully exit.
-func handleCommand(kv store.Storage, line string) bool {
-	// Split into at most 3 tokens: <command> [<key> [<value>]]
+func handleCommand(storage store.Storage, line string) bool {
 	parts := strings.SplitN(line, " ", 3)
-	cmd := strings.ToUpper(parts[0])
+	command := strings.ToUpper(parts[0])
 
-	switch cmd {
-	case "SET":
-		if len(parts) != 3 {
-			respond("ERR usage: SET <key> <value>")
-			return false
-		}
-		if err := kv.Set(parts[1], parts[2]); err != nil {
-			respond(fmt.Sprintf("ERR %v", err))
-			return false
-		}
-		respond("OK")
-
-	case "GET":
-		if len(parts) != 2 {
-			respond("ERR usage: GET <key>")
-			return false
-		}
-		value, ok := kv.Get(parts[1])
-		if ok {
-			respond(value)
-		} else {
-			respond("")
-		}
-
-	case "EXIT":
-		// Signal upstream caller to gracefully terminate the input loop.
+	switch command {
+	case commandSet:
+		handleSet(storage, parts)
+	case commandGet:
+		handleGet(storage, parts)
+	case commandExit:
 		return true
-
 	default:
 		respond(fmt.Sprintf("ERR unknown command: %s", parts[0]))
 	}
 
 	return false
+}
+
+func handleSet(storage store.Storage, parts []string) {
+	if len(parts) != 3 {
+		respond(setUsage)
+		return
+	}
+
+	if err := storage.Set(parts[1], parts[2]); err != nil {
+		respond(fmt.Sprintf("ERR %v", err))
+		return
+	}
+
+	respond("OK")
+}
+
+func handleGet(storage store.Storage, parts []string) {
+	if len(parts) != 2 {
+		respond(getUsage)
+		return
+	}
+
+	value, ok := storage.Get(parts[1])
+	if !ok {
+		respond("")
+		return
+	}
+
+	respond(value)
 }

@@ -1,5 +1,5 @@
 APP := kvstore.exe
-GRADEBOT := .\gradebot.exe
+GRADEBOT := ./gradebot.exe
 PROJECT := project-1
 RUN_PATH := $(CURDIR)\$(APP)
 
